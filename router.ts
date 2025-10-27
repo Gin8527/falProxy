@@ -39,6 +39,7 @@ console.log(`Loaded ${SUPPORTED_MODELS_MAP.size} supported models from .env`);
 
 
 // --- Dynamic Model Configuration & Caching ---
+// MODIFIED: ModelConfig is simpler now, no need for status_base_url
 interface ModelConfig {
     submit_url: string;
     supports_size_param: boolean;
@@ -55,6 +56,7 @@ async function fetchAndParseModelSchema(endpointId: string): Promise<ModelConfig
     const response = await fetch(openApiUrl);
     if (!response.ok) throw new Error(`Failed to fetch OpenAPI schema for ${endpointId}: ${response.status} ${response.statusText}`);
     
+    // (Schema parsing logic is largely the same, but simpler)
     const schema = await response.json();
     const postPathKey = `/${endpointId}`;
     const postPath = schema.paths?.[postPathKey]?.post;
@@ -131,99 +133,6 @@ function calculateAspectRatio(width: number, height: number): string { if (!widt
 const CORS_HEADERS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', };
 
 // --- Endpoint Handlers ---
-
-// 【新功能】处理 /v1/chat/completions 请求的函数
-async function handleChatCompletionsForImage(request: Request): Promise<Response> {
-    debugLog("--- New Chat Completions (for Image) Request ---");
-    const authResult = extractAndValidateApiKey(request);
-    if (!authResult.valid || !authResult.apiKey) return new Response(JSON.stringify({ error: { message: authResult.error || "Authentication failed.", type: "authentication_error" } }), { status: Status.Unauthorized });
-    const { apiKey } = authResult;
-
-    let chatRequestPayload;
-    try { chatRequestPayload = await request.json(); debugLog("Parsed Chat Request Payload:", chatRequestPayload); }
-    catch (error) { return new Response(JSON.stringify({ error: { message: "Missing or invalid JSON request body.", type: "invalid_request_error" } }), { status: Status.BadRequest }); }
-
-    // 从 messages 数组中提取 prompt
-    const { messages, model: requestedModel } = chatRequestPayload;
-    const lastUserMessage = messages?.filter((m: any) => m.role === 'user').pop();
-    const prompt = lastUserMessage?.content;
-
-    if (!prompt || typeof prompt !== 'string' || prompt.trim() === "") return new Response(JSON.stringify({ error: { message: "Could not find a valid user message to use as a prompt.", type: "invalid_request_error" } }), { status: Status.BadRequest });
-    
-    const modelName = requestedModel || "flux-dev"; // 如果客户端没传模型，使用默认模型
-    const numImages = 1; // Chat API 通常不支持 n > 1，这里硬编码为1
-    const requestedSize = "1024x1024"; // Chat API 没有 size 参数，硬编码一个默认值
-
-    debugLog(`Extracted prompt: "${prompt}" for model: "${modelName}"`);
-
-    const modelConfig = await getModelConfig(modelName);
-    if (!modelConfig) return new Response(JSON.stringify({ error: { message: `Model '${modelName}' not found or its configuration failed to load.`, type: "invalid_request_error" } }), { status: Status.NotFound });
-    
-    let width: number | undefined, height: number | undefined, aspectRatio: string | undefined;
-    const requestedDimensions = parseSize(requestedSize);
-    if (requestedDimensions) { width = requestedDimensions.width; height = requestedDimensions.height; aspectRatio = calculateAspectRatio(width, height); }
-    
-    const falRequestPayload: Record<string, any> = { prompt, num_images: numImages, enable_safety_checker: false };
-    if (width && height) {
-        if (modelConfig.uses_image_size_object) falRequestPayload.image_size = { width, height };
-        else if (modelConfig.supports_size_param) { falRequestPayload.width = width; falRequestPayload.height = height; }
-        if (aspectRatio && modelConfig.supports_aspect_ratio_param) falRequestPayload.aspect_ratio = aspectRatio;
-    }
-    debugLog("Constructed Fal Payload:", falRequestPayload);
-
-    try {
-        // 这部分复用 handleImageGenerations 的 Fal.ai 调用和轮询逻辑
-        const falSubmitResponse = await fetch(modelConfig.submit_url, { method: 'POST', headers: { "Authorization": `Key ${apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify(falRequestPayload) });
-        const submitResponseText = await falSubmitResponse.text();
-        if (!falSubmitResponse.ok) { /* ... 错误处理 ... */ }
-        const falSubmitData = JSON.parse(submitResponseText);
-        const { status_url, response_url, request_id } = falSubmitData;
-        if (!status_url || !response_url || !request_id) { /* ... 错误处理 ... */ }
-
-        let imageUrls: string[] = [];
-        for (let attempt = 0; attempt < 45; attempt++) {
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            const statusResponse = await fetch(status_url, { headers: { "Authorization": `Key ${apiKey}` } });
-            if (statusResponse.ok) {
-                const statusData = await statusResponse.json();
-                if (statusData.status === "COMPLETED") {
-                    const resultResponse = await fetch(response_url, { headers: { "Authorization": `Key ${apiKey}` } });
-                    if (resultResponse.ok) {
-                        const resultData = await resultResponse.json();
-                        if (resultData.images && Array.isArray(resultData.images)) resultData.images.forEach((img: any) => { if (img?.url) imageUrls.push(img.url); });
-                        if (imageUrls.length > 0) break;
-                    }
-                } else if (statusData.status === "FAILED" || statusData.status === "ERROR") { /* ... 错误处理 ... */ }
-            }
-        }
-        if (imageUrls.length === 0) return new Response(JSON.stringify({ error: { message: "Image generation timed out or returned no images.", type: "generation_timeout" } }), { status: Status.InternalServerError });
-        
-        // 【关键】将结果包装成 Chat Completions 的格式
-        const responseData = {
-            id: `chatcmpl-${crypto.randomUUID()}`,
-            object: "chat.completion",
-            created: Math.floor(Date.now() / 1000),
-            model: modelName,
-            choices: [{
-                index: 0,
-                message: {
-                    role: "assistant",
-                    // 将图片 URL 放在 content 里
-                    content: `Image generated successfully. You can view it here: ${imageUrls[0]}`,
-                },
-                finish_reason: "stop",
-            }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, // 伪造 usage 数据
-        };
-        return new Response(JSON.stringify(responseData), { status: Status.OK });
-
-    } catch (e: any) {
-        console.error(`Unhandled exception in handleChatCompletionsForImage: ${e.toString()}`, e.stack);
-        return new Response(JSON.stringify({ error: { message: `Server error: ${e.toString()}`, type: "server_error" } }), { status: Status.InternalServerError });
-    }
-}
-
-
 async function handleImageGenerations(request: Request): Promise<Response> {
     debugLog("--- New Image Generation Request ---");
     const authResult = extractAndValidateApiKey(request);
@@ -332,9 +241,7 @@ warmupCache().then(() => {
         console.log(`[${new Date(startTime).toISOString()}] --> ${request.method} ${path}`);
         let response: Response;
         try {
-            // 【修改】在这里添加新的路由
-            if (path === '/v1/chat/completions' && request.method === 'POST') response = await handleChatCompletionsForImage(request);
-            else if (path === '/v1/images/generations' && request.method === 'POST') response = await handleImageGenerations(request);
+            if (path === '/v1/images/generations' && request.method === 'POST') response = await handleImageGenerations(request);
             else if (path === '/v1/models' && request.method === 'GET') response = await listModels();
             else if (path === '/health' && request.method === 'GET') response = new Response(JSON.stringify({ status: "ok" }));
             else response = new Response(JSON.stringify({ error: { message: "Not Found" } }), { status: Status.NotFound });
